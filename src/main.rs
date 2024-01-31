@@ -247,6 +247,7 @@ async fn main() {
         };
         drop(config);
         if did_update {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             let radvd_pid = nix::unistd::Pid::from_raw(radvd_pid.load(std::sync::atomic::Ordering::Relaxed) as i32);
             if let Err(err) = nix::sys::signal::kill(radvd_pid, nix::sys::signal::Signal::SIGHUP) {
                 warn!("Failed to reload radvd: {}", err);
