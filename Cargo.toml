@@ -6,8 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+clap = { version = "4.4.18", features = ["derive"] }
 futures-util = "0.3.29"
+log = "0.4.20"
 netlink-packet-route = "0.17.1"
+nix = { version = "0.27.1", features = ["process", "signal"] }
+pretty_env_logger = "0.5.0"
 rtnetlink = "0.13.1"
-
-tokio = { version = "1.34.0", features = ["net", "macros", "rt-multi-thread"] }
+serde = { version = "1.0.196", features = ["derive"] }
+serde_json = "1.0.112"
+tempfile = "3.9.0"
+tera = "1.19.1"
+tokio = { version = "1.34.0", features = ["net", "macros", "rt-multi-thread", "sync", "fs", "signal", "process"] }

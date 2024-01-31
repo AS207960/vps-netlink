@@ -1,0 +1,10 @@
+{
+  "rt_proto": 200,
+  "interface": "eth0",
+  "vps": [{
+    "vlan": 1001,
+    "v4_addr": "100.64.0.5",
+    "v4_public": null,
+    "v6_prefix": "2a11:f2c0:3::"
+  }]
+}

@@ -1,0 +1,33 @@
+{
+  "Dhcp4": {
+    "valid-lifetime": 4000,
+    "renew-timer": 1000,
+    "rebind-timer": 2000,
+    "lease-database": {
+      "name": "/var/lib/kea/dhcp4.leases",
+      "persist": true,
+      "type": "memfile"
+    },
+    "interfaces-config": {
+      "interfaces": [ "*" ]
+    },
+    "option-data": [{
+      "name": "domain-name-servers",
+      "data": "193.3.165.33"
+    }, {
+      "name": "routers",
+      "data": "193.3.165.62"
+    }],
+    "shared-networks": [{% for interface in interfaces %}{
+      "name": "{{ interface.name }}",
+      "interface": "{{ interface.name }}",
+      "subnet4": [{
+        "subnet": "{{ interface.vps.v4_addr }}/31",
+        "pools": [{"pool": "{{ interface.vps.v4_addr }}/32"}]
+      }{% if interface.vps.v4_public %}, {
+        "subnet": "{{ interface.vps.v4_public }}/32";
+        "pools": [{ pool = "{{ interface.vps.v4_public }}/32"; }];
+      }{% endif %}]
+    }{% if not loop.last %}, {% endif %}{% endfor %}]
+  }
+}

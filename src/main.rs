@@ -1,11 +1,28 @@
-use futures_util::TryStreamExt;
+#[macro_use]
+extern crate log;
 
-const VPS_RT_PROTO: u8 = 200;
-const VPS_INTERFACE: &'static str = "eth0";
+use clap::Parser;
+
+mod config;
+mod netlink;
+mod diff;
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(long)]
+    config: std::path::PathBuf,
+    #[arg(long)]
+    templates: String,
+    #[arg(long)]
+    radvd: std::path::PathBuf,
+    #[arg(long)]
+    kea: std::path::PathBuf,
+}
 
 #[derive(Debug)]
 enum Error {
-    NetlinkError(rtnetlink::Error),
+    Netlink(rtnetlink::Error),
+    Tera(tera::Error),
     Io(std::io::Error),
     InterfaceNotFound(String),
 }
@@ -16,471 +33,228 @@ impl From<rtnetlink::Error> for Error {
             rtnetlink::Error::NetlinkError(e) => {
                 Self::Io(e.to_io())
             }
-            v => Self::NetlinkError(v)
+            v => Self::Netlink(v)
         }
     }
 }
 
-struct VPS {
-    vlan: u16,
-    v4_addr: std::net::Ipv4Addr,
-    v4_public: Option<std::net::Ipv4Addr>,
-    v6_prefix: std::net::Ipv6Addr,
-}
-
-const TARGET_VPS: &'static [VPS] = &[
-    VPS {
-        vlan: 4000,
-        v4_addr: std::net::Ipv4Addr::new(100, 64, 0, 0),
-        v4_public: Some(std::net::Ipv4Addr::new(193, 3, 165, 223)),
-        v6_prefix: std::net::Ipv6Addr::new(0x2a11, 0xf2c0, 0x3, 0, 0, 0, 0, 0)
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
     }
-];
-
-#[derive(Debug)]
-struct Interface {
-    name: String,
-    index: u32,
-    link: u32,
-    vlan: u16,
 }
 
-#[derive(Debug)]
-struct Address {
-    interface: u32,
-    address: std::net::IpAddr,
-    prefix_length: u8,
-    message: netlink_packet_route::address::AddressMessage,
+impl From<tera::Error> for Error {
+    fn from(value: tera::Error) -> Self {
+        Self::Tera(value)
+    }
 }
 
-#[derive(Debug)]
-struct Route {
-    destination: std::net::IpAddr,
-    destination_prefix_length: u8,
-    interface: u32,
-    message: netlink_packet_route::route::RouteMessage,
-}
-
-#[derive(Debug)]
-struct AddAddress {
-    address: std::net::IpAddr,
-    prefix_length: u8,
-    interface_name: String,
-}
-
-#[derive(Debug)]
-struct AddRoute {
-    destination: std::net::IpAddr,
-    destination_prefix_length: u8,
-    interface_name: String,
-}
-
-#[derive(Debug)]
-enum Diff {
-    AddInterface(Interface),
-    RemoveInterface(u32),
-    AddAddress(AddAddress),
-    RemoveAddress(netlink_packet_route::address::AddressMessage),
-    AddRoute(AddRoute),
-    RemoveRoute(netlink_packet_route::route::RouteMessage),
-}
-
-async fn get_vlan_interfaces(handle: &rtnetlink::Handle) -> Result<Vec<Interface>, Error> {
-    let mut links = handle.link().get().execute();
-    let mut interfaces = vec![];
-
-    let mut vps_infs = vec![];
-
-    'outer: while let Some(msg) = links.try_next().await? {
-        for nla in &msg.nlas {
-            if let netlink_packet_route::nlas::link::Nla::Info(infos) = nla {
-                for info in infos {
-                    if let netlink_packet_route::nlas::link::Info::Kind(
-                        netlink_packet_route::nlas::link::InfoKind::Vlan
-                    ) = info {
-                        for nla in &msg.nlas {
-                            if let netlink_packet_route::nlas::link::Nla::IfName(name) = nla {
-                                if name.starts_with("vps") {
-                                    vps_infs.push(msg);
-                                    continue 'outer;
-                                }
-                            }
-                        }
-                    }
-                }
+async fn handle_signals(
+    mut signals: tokio::signal::unix::Signal,
+    config_path: std::path::PathBuf,
+    config: std::sync::Arc<tokio::sync::Mutex<config::Config>>
+) {
+    while let Some(()) = signals.recv().await {
+        let config_file = match tokio::fs::read(&config_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to open config file: {}", e);
+                continue;
             }
-        }
-    }
-
-    for msg in vps_infs {
-        let mut inf = Interface {
-            index: msg.header.index,
-            name: String::default(),
-            link: 0,
-            vlan: 0
         };
-
-        for nla in msg.nlas {
-            match nla {
-                netlink_packet_route::nlas::link::Nla::Info(infos) => {
-                    for info in infos {
-                        if let netlink_packet_route::nlas::link::Info::Data(
-                            netlink_packet_route::nlas::link::InfoData::Vlan(data)
-                        ) = info {
-                            for datum in data {
-                                if let netlink_packet_route::nlas::link::InfoVlan::Id(
-                                    vlan
-                                ) = datum {
-                                    inf.vlan = vlan
-                                }
-                            }
-                        }
-                    }
-                }
-                netlink_packet_route::nlas::link::Nla::Link(link) => {
-                    inf.link = link;
-                },
-                netlink_packet_route::nlas::link::Nla::IfName(name) => {
-                    inf.name = name;
-                },
-                _ => {}
+        let new_config: config::Config = match serde_json::from_slice(&config_file) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to parse config file: {}", e);
+                continue;
             }
-        }
-
-        interfaces.push(inf);
-    }
-
-    Ok(interfaces)
-}
-
-
-async fn get_addresses(handle: &rtnetlink::Handle) -> Result<Vec<Address>, Error> {
-    let mut addresses = vec![];
-
-    let mut res = handle.address().get().execute();
-    while let Some(msg) = res.try_next().await? {
-        if msg.header.scope != netlink_packet_route::constants::RT_SCOPE_UNIVERSE {
-            continue;
-        }
-
-        let mut address = Address {
-            interface: msg.header.index,
-            address: std::net::IpAddr::from([0, 0, 0, 0]),
-            prefix_length: msg.header.prefix_len,
-            message: msg.clone()
         };
-
-
-        for nla in msg.nlas {
-            match nla {
-                netlink_packet_route::nlas::address::Nla::Address(d) => {
-                    match msg.header.family as u16 {
-                        netlink_packet_route::constants::AF_INET => {
-                            let data: [u8; 4] = d.try_into().unwrap();
-                            address.address = std::net::IpAddr::V4(
-                                std::net::Ipv4Addr::from(data)
-                            )
-                        }
-                        netlink_packet_route::constants::AF_INET6 => {
-                            let data: [u8; 16] = d.try_into().unwrap();
-                            address.address = std::net::IpAddr::V6(
-                                std::net::Ipv6Addr::from(data)
-                            )
-                        },
-                        _ => {}
-                    }
-                },
-                _ => {}
-            }
-        }
-
-        addresses.push(address);
+        *config.lock().await = new_config;
+        info!("Config reloaded");
     }
-
-    Ok(addresses)
 }
 
-
-async fn get_routes(handle: &rtnetlink::Handle) -> Result<Vec<Route>, Error> {
-    let mut routes = vec![];
-    let mut vps_routes = vec![];
-
-    let mut v4_routes = handle.route().get(rtnetlink::IpVersion::V4).execute();
-    while let Some(msg) = v4_routes.try_next().await? {
-        if msg.header.protocol == VPS_RT_PROTO {
-            vps_routes.push(msg);
-        }
-    }
-
-    let mut v6_routes = handle.route().get(rtnetlink::IpVersion::V6).execute();
-    while let Some(msg) = v6_routes.try_next().await? {
-        if msg.header.protocol == VPS_RT_PROTO {
-            vps_routes.push(msg);
-        }
-    }
-
-    'outer: for msg in vps_routes {
-        let mut route = Route {
-            destination: std::net::IpAddr::from([0, 0, 0, 0]),
-            destination_prefix_length: msg.header.destination_prefix_length,
-            interface: 0,
-            message: msg.clone(),
-        };
-
-        for nla in msg.nlas {
-            match nla {
-                netlink_packet_route::nlas::route::Nla::Oif(i) => {
-                    route.interface = i;
-                },
-                netlink_packet_route::nlas::route::Nla::Destination(d) => {
-                    match msg.header.address_family as u16 {
-                        netlink_packet_route::constants::AF_INET => {
-                            let data: [u8; 4] = d.try_into().unwrap();
-                            route.destination = std::net::IpAddr::V4(
-                                std::net::Ipv4Addr::from(data)
-                            )
-                        }
-                        netlink_packet_route::constants::AF_INET6 => {
-                            let data: [u8; 16] = d.try_into().unwrap();
-                            route.destination = std::net::IpAddr::V6(
-                                std::net::Ipv6Addr::from(data)
-                            )
-                        },
-                        _ => continue 'outer
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        routes.push(route);
-    }
-
-    Ok(routes)
+struct ConfigPaths<'a> {
+    radvd: &'a std::path::Path,
+    kea: &'a std::path::Path,
 }
 
+async fn update(
+    handle: &rtnetlink::Handle,
+    templates: &tera::Tera,
+    config: &config::Config,
+    config_paths: ConfigPaths<'_>,
+    first_update: bool,
+) -> Result<bool, Error> {
+    let state = netlink::get_state(&handle, config.rt_proto).await?;
+    let (diff, interfaces) = diff::make_diff(&handle, &config.interface, &config.vps, state).await?;
 
-async fn interface_name_to_index(handle: &rtnetlink::Handle, name: &str) -> Result<u32, Error> {
-    let mut res = handle.link().get().match_name(name.to_string()).execute();
+    if !diff.is_empty() || first_update {
+        info!("Updating interfaces");
+        diff::apply_diff(&handle, config.rt_proto, diff).await?;
+        update_config(templates, "radvd.tera", config_paths.radvd, &interfaces).await?;
+        update_config(templates, "kea.tera", config_paths.kea, &interfaces).await?;
 
-    res.try_next().await?.map(|msg| {
-        msg.header.index
-    }).ok_or_else(|| {
-        Error::InterfaceNotFound(name.to_string())
-    })
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
-#[derive(Debug)]
-struct State {
-    interfaces: Vec<Interface>,
-    addresses: Vec<Address>,
-    routes: Vec<Route>,
-}
-
-async fn make_diff(
-    handle: &rtnetlink::Handle, target: &[VPS],
-    state: State
-) -> Result<Vec<Diff>, Error> {
-    let mut keep_interfaces = vec![];
-    let mut keep_routes = vec![];
-    let mut rem_addresses = vec![];
-
-    let mut diff = vec![];
-
-    let mut next_interface_id = state.interfaces.iter().map(|i| {
-        usize::from_str_radix(&i.name[3..], 10).unwrap_or(0)
-    }).max().unwrap_or(0) + 1;
-    let link_interface = interface_name_to_index(handle, VPS_INTERFACE).await?;
-
-    for vps in target {
-        match state.interfaces.iter().find(|i| i.vlan == vps.vlan) {
-            Some(i) => {
-                keep_interfaces.push(i.index);
-
-                let mut found_v4_addr = false;
-
-                for address in state.addresses.iter().filter(|a| a.interface == i.index) {
-                    match &address.address {
-                        std::net::IpAddr::V4(dest) => {
-                            if &vps.v4_addr == dest && address.prefix_length == 31 {
-                                found_v4_addr = true;
-                            } else {
-                                rem_addresses.push(address.message.clone());
-                            }
-                        }
-                        std::net::IpAddr::V6(_) => {}
-                    }
-                }
-
-                if !found_v4_addr {
-                    diff.push(Diff::AddAddress(AddAddress {
-                        address: std::net::IpAddr::V4(vps.v4_addr),
-                        prefix_length: 31,
-                        interface_name: i.name.clone(),
-                    }));
-                }
-
-                let mut found_v4 = false;
-                let mut found_v6 = false;
-
-                for route in state.routes.iter().filter(|r| r.interface == i.index) {
-                    match route.destination {
-                        std::net::IpAddr::V4(dest) => {
-                            if let Some(public_v4) = &vps.v4_public {
-                                if public_v4 == &dest && route.destination_prefix_length == 32 {
-                                    keep_routes.push(route.message.clone());
-                                    found_v4 = true;
-                                }
-                            }
-                        }
-                        std::net::IpAddr::V6(dest) => {
-                            if vps.v6_prefix == dest && route.destination_prefix_length == 64 {
-                                keep_routes.push(route.message.clone());
-                                found_v6 = true;
-                            }
-                        }
-                    }
-                }
-
-                if !found_v4 {
-                    if let Some(public_v4) = &vps.v4_public {
-                        diff.push(Diff::AddRoute(AddRoute {
-                            destination: std::net::IpAddr::V4(public_v4.clone()),
-                            destination_prefix_length: 32,
-                            interface_name: i.name.clone(),
-                        }));
-                    }
-                }
-                if !found_v6 {
-                    diff.push(Diff::AddRoute(AddRoute {
-                        destination: std::net::IpAddr::V6(vps.v6_prefix.clone()),
-                        destination_prefix_length: 64,
-                        interface_name: i.name.clone(),
-                    }));
-                }
-            },
-            None => {
-                let id = next_interface_id;
-                next_interface_id += 1;
-                let interface_name = format!("vps{}", id);
-
-                diff.push(Diff::AddInterface(Interface {
-                    name: interface_name.clone(),
-                    index: 0,
-                    link: link_interface,
-                    vlan: vps.vlan
-                }));
-                diff.push(Diff::AddAddress(AddAddress {
-                    address: std::net::IpAddr::V4(vps.v4_addr),
-                    prefix_length: 31,
-                    interface_name: interface_name.clone(),
-                }));
-                if let Some(public_v4) = &vps.v4_public {
-                    diff.push(Diff::AddRoute(AddRoute {
-                        destination: std::net::IpAddr::V4(public_v4.clone()),
-                        destination_prefix_length: 32,
-                        interface_name: interface_name.clone(),
-                    }));
-                }
-                diff.push(Diff::AddRoute(AddRoute {
-                    destination: std::net::IpAddr::V6(vps.v6_prefix.clone()),
-                    destination_prefix_length: 64,
-                    interface_name: interface_name.clone(),
-                }));
-            }
-        }
-    }
-
-    let mut rem_interfaces = vec![];
-
-    for interface in &state.interfaces {
-        if !keep_interfaces.contains(&interface.index) {
-            diff.push(Diff::RemoveInterface(interface.index));
-            rem_interfaces.push(interface.index);
-        }
-    }
-
-    for route in &state.routes {
-        if !keep_routes.contains(&route.message) && !rem_interfaces.contains(&route.interface) {
-            diff.push(Diff::RemoveRoute(route.message.clone()));
-        }
-    }
-
-    for address in rem_addresses {
-        diff.push(Diff::RemoveAddress(address));
-    }
-
-    Ok(diff)
-}
-
-async fn apply_diff(handle: &rtnetlink::Handle, diff: Vec<Diff>) -> Result<(), Error> {
-    for command in diff {
-        match command {
-            Diff::AddInterface(i) => {
-                handle.link().add()
-                    .vlan(i.name, i.link, i.vlan)
-                    .execute().await?;
-            }
-            Diff::RemoveInterface(i) => {
-                handle.link().del(i).execute().await?;
-            }
-            Diff::AddAddress(a) => {
-                let interface = interface_name_to_index(handle, &a.interface_name).await?;
-                handle.address()
-                    .add(interface, a.address, a.prefix_length)
-                    .execute().await?;
-            }
-            Diff::RemoveAddress(a) => {
-                handle.address()
-                    .del(a)
-                    .execute().await?;
-            }
-            Diff::AddRoute(r) => {
-                let interface = interface_name_to_index(handle, &r.interface_name).await?;
-                let req = handle.route().add()
-                    .protocol(VPS_RT_PROTO)
-                    .output_interface(interface);
-                match r.destination {
-                    std::net::IpAddr::V4(v4) => {
-                        req.v4()
-                            .destination_prefix(v4, r.destination_prefix_length)
-                            .execute().await?;
-                    }
-                    std::net::IpAddr::V6(v6) => {
-                        req.v6()
-                            .destination_prefix(v6, r.destination_prefix_length)
-                            .execute().await?;
-                    }
-                };
-            }
-            Diff::RemoveRoute(msg) => {
-                handle.route()
-                    .del(msg)
-                    .execute().await?;
-            }
-        }
-    }
-
+async fn update_config(
+    templates: &tera::Tera,
+    template: &str,
+    config_file: &std::path::Path,
+    interfaces: &[diff::InterfaceState<'_>]
+) -> Result<(), Error>  {
+    let mut context = tera::Context::new();
+    context.insert("interfaces", interfaces);
+    let config = templates.render(template, &context)?;
+    tokio::fs::write(config_file, config).await?;
     Ok(())
+}
+
+async fn run_radvd(
+    radvd_path: &std::path::Path,
+    config_path: &std::path::Path,
+    pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        info!("Starting radvd");
+        let mut command = tokio::process::Command::new(radvd_path);
+        command.arg("--nodaemon");
+        command.arg("--logmethod=stderr");
+        command.arg("-C");
+        command.arg(config_path);
+
+        let mut handle = match command.spawn() {
+            Ok(h) => h,
+            Err(err) => {
+                error!("Failed to start radvd: {}", err);
+                continue
+            }
+        };
+        pid.store(handle.id().unwrap(), std::sync::atomic::Ordering::Relaxed);
+        match handle.wait().await {
+            Ok(s) => {
+                if !s.success() {
+                    warn!("radvd exited with code: {}", s);
+                }
+            }
+            Err(err) => {
+                error!("radvd failed: {}", err);
+            }
+        }
+    }
+}
+
+async fn run_kea(
+    kea_path: &std::path::Path,
+    config_path: &std::path::Path,
+    pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) -> Result<(), Error> {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        info!("Starting kea");
+        let mut command = tokio::process::Command::new(kea_path);
+        command.arg("-c");
+        command.arg(config_path);
+        command.env("KEA_PIDFILE_DIR", "/run");
+
+        let mut handle = match command.spawn() {
+            Ok(h) => h,
+            Err(err) => {
+                error!("Failed to start kea: {}", err);
+                continue
+            }
+        };
+        pid.store(handle.id().unwrap(), std::sync::atomic::Ordering::Relaxed);
+        match handle.wait().await {
+            Ok(s) => {
+                if !s.success() {
+                    warn!("kea exited with code: {}", s);
+                }
+            }
+            Err(err) => {
+                error!("kea failed: {}", err);
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let (conn, handle, mut _messages) = rtnetlink::new_connection().unwrap();
+    pretty_env_logger::init();
+    let args = Args::parse();
 
+    let tera = tera::Tera::new(&args.templates).expect("Unable to setup Tera");
+
+    let signals = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).expect("Unable to create signal listener");
+
+    let config_file = tokio::fs::read(&args.config).await.expect("Unable to open config file");
+    let config: config::Config = serde_json::from_slice(&config_file).expect("Unable to parse config file");
+    info!("Config loaded");
+
+    let radvd_config_file = tempfile::Builder::new()
+        .prefix("radvd")
+        .tempfile().expect("Unable to create radvd config file");
+    let kea_config_file = tempfile::Builder::new()
+        .prefix("kea")
+        .tempfile().expect("Unable to create kea config file");
+
+    let (conn, handle, mut _messages) = rtnetlink::new_connection().expect("Unable to open netlink");
     tokio::spawn(conn);
 
-    let interfaces = get_vlan_interfaces(&handle).await.unwrap();
-    let addresses = get_addresses(&handle).await.unwrap();
-    let routes = get_routes(&handle).await.unwrap();
+    if let Err(err) = update(&handle, &tera, &config, ConfigPaths {
+        radvd: radvd_config_file.path(),
+        kea: kea_config_file.path(),
+    }, true).await {
+        error!("Failed to run first update: {:?}", err);
+        return;
+    }
 
-    let state = State {
-        interfaces,
-        addresses,
-        routes
-    };
+    let radvd_config_file_path = radvd_config_file.path().to_path_buf();
+    let kea_config_file_path = kea_config_file.path().to_path_buf();
+    let radvd_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let kea_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let radvd_pid_1 = radvd_pid.clone();
+    let kea_pid_1 = kea_pid.clone();
+    tokio::task::spawn(async move {
+        run_radvd(&args.radvd, &radvd_config_file_path, radvd_pid_1).await;
+    });
+    tokio::task::spawn(async move {
+        run_kea(&args.kea, &kea_config_file_path, kea_pid_1).await.expect("Unable to start kea");
+    });
 
-    let diff = make_diff(&handle, TARGET_VPS, state).await.unwrap();
-    println!("State change: {:#?}", diff);
-    apply_diff(&handle, diff).await.unwrap();
+    let config = std::sync::Arc::new(tokio::sync::Mutex::new(config));
+
+    tokio::spawn(handle_signals(signals, args.config.clone(), config.clone()));
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let config = config.lock().await;
+        let did_update = match update(&handle, &tera, &config, ConfigPaths {
+            radvd: radvd_config_file.path(),
+            kea: kea_config_file.path(),
+        }, false).await {
+            Ok(d) => d,
+            Err(err) => {
+                error!("Failed to run update: {:?}", err);
+                continue;
+            }
+        };
+        drop(config);
+        if did_update {
+            let radvd_pid = nix::unistd::Pid::from_raw(radvd_pid.load(std::sync::atomic::Ordering::Relaxed) as i32);
+            if let Err(err) = nix::sys::signal::kill(radvd_pid, nix::sys::signal::Signal::SIGHUP) {
+                warn!("Failed to reload radvd: {}", err);
+            }
+            let kea_pid = nix::unistd::Pid::from_raw(kea_pid.load(std::sync::atomic::Ordering::Relaxed) as i32);
+            if let Err(err) = nix::sys::signal::kill(kea_pid, nix::sys::signal::Signal::SIGHUP) {
+                warn!("Failed to reload kea: {}", err);
+            }
+        }
+    }
 }
