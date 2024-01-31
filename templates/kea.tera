@@ -24,10 +24,10 @@
       "subnet4": [{
         "subnet": "{{ interface.vps.v4_addr }}/31",
         "pools": [{"pool": "{{ interface.vps.v4_addr }}/32"}]
-      }{% if interface.vps.v4_public %}, {
-        "subnet": "{{ interface.vps.v4_public }}/32";
-        "pools": [{ pool = "{{ interface.vps.v4_public }}/32"; }];
-      }{% endif %}]
+      }{% if interface.vps.v4_public %}{% for ip in interface.vps.v4_public %}, {
+        "subnet": "{{ interface.vps.v4_public }}/32",
+        "pools": [{ pool = "{{ interface.vps.v4_public }}/32" }],
+      }{% endfor %}{% endif %}]
     }{% if not loop.last %}, {% endif %}{% endfor %}]
   }
 }
