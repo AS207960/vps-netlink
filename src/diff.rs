@@ -79,16 +79,17 @@ pub async fn make_diff<'a>(
                     }));
                 }
 
-                let mut found_v4 = false;
+                let mut found_v4 = vec![];
                 let mut found_v6 = false;
 
                 for route in state.routes.iter().filter(|r| r.interface == i.index) {
                     match route.destination {
                         std::net::IpAddr::V4(dest) => {
                             if let Some(public_v4) = &vps.v4_public {
-                                if public_v4 == &dest && route.destination_prefix_length == 32 {
+                                let addrs = public_v4.as_many();
+                                if addrs.contains(&dest) && route.destination_prefix_length == 32 {
                                     keep_routes.push(route.message.clone());
-                                    found_v4 = true;
+                                    found_v4.push(dest);
                                 }
                             }
                         }
@@ -101,18 +102,19 @@ pub async fn make_diff<'a>(
                     }
                 }
 
-                if !found_v4 {
-                    if let Some(public_v4) = &vps.v4_public {
+                if let Some(public_v4) = &vps.v4_public {
+                    for addr in public_v4.as_many().iter().filter(|p| !found_v4.contains(p)) {
                         diff_add.push(Diff::AddRoute(AddRoute {
-                            destination: std::net::IpAddr::V4(public_v4.clone()),
+                            destination: std::net::IpAddr::V4(*addr),
                             destination_prefix_length: 32,
                             interface_name: i.name.clone(),
                         }));
                     }
                 }
+
                 if !found_v6 {
                     diff_add.push(Diff::AddRoute(AddRoute {
-                        destination: std::net::IpAddr::V6(vps.v6_prefix.clone()),
+                        destination: std::net::IpAddr::V6(vps.v6_prefix),
                         destination_prefix_length: 64,
                         interface_name: i.name.clone(),
                     }));
@@ -140,11 +142,13 @@ pub async fn make_diff<'a>(
                     interface_name: interface_name.clone(),
                 }));
                 if let Some(public_v4) = &vps.v4_public {
-                    diff_add.push(Diff::AddRoute(AddRoute {
-                        destination: std::net::IpAddr::V4(public_v4.clone()),
-                        destination_prefix_length: 32,
-                        interface_name: interface_name.clone(),
-                    }));
+                    for addr in public_v4.as_many() {
+                        diff_add.push(Diff::AddRoute(AddRoute {
+                            destination: std::net::IpAddr::V4(*addr),
+                            destination_prefix_length: 32,
+                            interface_name: interface_name.clone(),
+                        }));
+                    }
                 }
                 diff_add.push(Diff::AddRoute(AddRoute {
                     destination: std::net::IpAddr::V6(vps.v6_prefix.clone()),
